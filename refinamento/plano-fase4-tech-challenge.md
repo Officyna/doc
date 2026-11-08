@@ -49,9 +49,11 @@ flowchart TD
         Kong -->|/api/v1/billing| BillSvc["💳 Billing Service\n(officyna-billing-service)"]
         Kong -->|/api/v1/production| ProdSvc["🔧 Production Service\n(officyna-production-service)"]
         
-        OSSvc <-->|Eventos Saga| Broker["📬 Message Broker\n(RabbitMQ / AWS SQS)"]
-        BillSvc <-->|Eventos Saga| Broker
-        ProdSvc <-->|Eventos Saga| Broker
+        OSSvc -.->|HTTP Síncrono: Valida/Snapshot de Serviços| ProdSvc
+        
+        OSSvc <-->|Eventos Saga (Assíncrono)| Broker["📬 Message Broker\n(RabbitMQ / AWS SQS)"]
+        BillSvc <-->|Eventos Saga (Assíncrono)| Broker
+        ProdSvc <-->|Eventos Saga (Assíncrono)| Broker
     end
 
     BillSvc -->|Checkout / Webhook| MP["💰 Mercado Pago API"]
@@ -152,6 +154,37 @@ Conforme os requisitos da Fase 4, o **Production Service** atua como o sistema d
 4. **Métricas de Produtividade**: Absorção e evolução do submódulo `monitoring` para medição contínua de tempos médios de execução e eficiência operacional dos boxes.
 5. **Participação no Rollback do Saga**: Em caso de impedimento técnico crítico ou falta definitiva de insumos no pátio, publicação de evento de cancelamento que aciona o estorno automático de pagamento no `Billing Service`.
 
+---
+
+### 3.5. Matriz e Diretrizes de Comunicação: Síncrona (HTTP REST) vs Assíncrona (Mensageria / Broker)
+
+Para equilibrar desacoplamento temporal, resiliência e consistência de dados entre os domínios, a arquitetura adota a seguinte **regra de ouro de comunicação**:
+
+> [!TIP]
+> **Regra de Decisão Arquitetural:**
+> 1. **Comunicação Síncrona (HTTP REST / Kong / Feign):** Utilizada exclusivamente para **consultas de leitura (Queries)**, validações imediatas (*fail-fast*) onde o chamador necessita da resposta para prosseguir, autenticação e recepção de webhooks externos.
+> 2. **Comunicação Assíncrona (Event-Driven via Broker):** Utilizada para **mudanças de estado de negócio (Comandos/Eventos)**, orquestração/coreografia do ciclo de vida (Saga Pattern) e ações com efeitos colaterais distribuídos. Garante que se um microsserviço a jusante estiver temporariamente indisponível, a mensagem fica retida na fila com garantia de entrega posterior.
+
+#### Tabela de Mapeamento Completo dos Fluxos
+
+| ID | Fluxo / Operação de Negócio | Origem | Destino | Tipo | Mecanismo / Protocolo | Justificativa Arquitetural (DDD) |
+| :--- | :--- | :--- | :--- | :---: | :--- | :--- |
+| **S1** | **Autenticação de Usuários / Clientes** | Cliente / Staff | Componente Auth / Lambda | **Síncrono** | `POST /auth/login` (HTTP) | Requer retorno imediato do token JWT para viabilizar as próximas requisições. |
+| **S2** | **Consulta do Catálogo de Serviços/Peças** | Frontend / Atendente | `officyna-production-service` | **Síncrono** | `GET /api/v1/production/labors` via Kong | Leitura imediata para popular telas de seleção e balcão. |
+| **S3** | **Validação e Snapshot de Serviços na Criação da OS** | `officyna-os-service` | `officyna-production-service` | **Síncrono** | `GET /api/v1/production/labors/summary?ids=...` (OpenFeign) | **Fail-fast:** A OS só pode ser aberta se os serviços existirem e estiverem ativos. Captura o snapshot imutável de preço e descrição no momento do registro. |
+| **S4** | **Consulta de Clientes e Veículos** | Frontend / Atendente | `officyna-os-service` | **Síncrono** | `GET /api/v1/customers`, `GET /api/v1/vehicles` via Kong | Leitura direta do contexto de entrada/balcão. |
+| **S5** | **Consulta de Orçamento e Status de Pagamento** | Cliente / App | `officyna-billing-service` | **Síncrono** | `GET /api/v1/billing/orders/{orderId}` via Kong | Leitura do resumo financeiro e link do Pix gerado. |
+| **S6** | **Notificação de Pagamento (IPN Webhook)** | Mercado Pago API | `officyna-billing-service` | **Síncrono** | `POST /api/v1/billing/webhooks/mercadopago` (HTTP) | Webhook padrão HTTP externo exigido pelo gateway de pagamento. |
+| **S7** | **Início/Término de Serviços no Pátio** | `officyna-production-service` | `officyna-os-service` | **Síncrono** | `PUT /api/serviceorder/{id}/start-labor/{laborId}`, `PUT .../finish-labor/...` | Apontamento granular de execução operacional pelo mecânico. |
+| **S8** | **Finalização de Serviços da OS** | `officyna-production-service` | `officyna-os-service` | **Síncrono** | `PATCH /api/serviceorder/{id}/update-status/?status=FINALIZADA` | Transição de encerramento dos trabalhos de oficina. |
+| **S9** | **Registro de Entrega do Veículo** | Atendente / Balcão | `officyna-os-service` | **Síncrono** | `PATCH /api/serviceorder/{id}/update-status/?status=ENTREGUE` | Valida status `FINALIZADA` e preenche `deliveryDate = now()`. |
+| **A1** | **Disponibilização para Produção / Diagnóstico** | `officyna-os-service` | Broker ➔ `officyna-production-service` | **Assíncrono** | Evento: `eventForDiagnostics` | Enfileira a nova OS no pátio com status `RECEBIDA`. |
+| **A2** | **Início do Diagnóstico pelo Mecânico** | `officyna-production-service` | Broker ➔ `officyna-os-service` | **Assíncrono** | Evento: `eventDiagnosis` | Transiciona a OS para `EM_DIAGNOSTICO` e associa o mecânico. |
+| **A3** | **Diagnóstico Técnico Finalizado** | `officyna-production-service` | Broker ➔ `officyna-billing-service` | **Assíncrono** | Evento: `eventDiagnosisCompleted` | Aciona o cálculo contábil do orçamento formal no PostgreSQL. |
+| **A4** | **Orçamento Calculado e Pix Gerado** | `officyna-billing-service` | Broker ➔ `officyna-os-service` | **Assíncrono** | Evento: `eventBudgetGenerated` | Atualiza a OS para `AGUARDANDO_APROVACAO` com os valores e o link Pix. |
+| **A5** | **Confirmação de Pagamento** | `officyna-billing-service` | Broker ➔ `officyna-os-service` e `officyna-production-service` | **Assíncrono** | Evento: `PaymentConfirmedEvent` *(Fanout / PubSub)* | Notifica múltiplos interessados em paralelo: OS transiciona para `APROVADA` e Produção libera para o pátio. |
+| **A6** | **Compensação por Rejeição / Expirado** | `officyna-billing-service` | Broker ➔ `officyna-os-service` | **Assíncrono** | Evento: `BudgetRejectedEvent` / `PaymentFailedEvent` | Rollback do Saga: cancela reservas e atualiza status da OS para `RECUSADA`. |
+| **A7** | **Compensação por Bloqueio na Produção** | `officyna-production-service` | Broker ➔ `officyna-billing-service` e `officyna-os-service` | **Assíncrono** | Evento: `ProductionAbortedEvent` | Rollback do Saga: dispara estorno de pagamento no Mercado Pago e cancela a OS. |
 
 ---
 
@@ -159,36 +192,113 @@ Conforme os requisitos da Fase 4, o **Production Service** atua como o sistema d
 
 Para este projeto, propõe-se a abordagem **Saga Coreografada** (ou **Orquestrada pelo OS Service**, atuando como Coordenador do Ciclo de Vida da OS):
 
-### 4.1. Fluxo Transacional (Caminho Feliz)
+### 4.1. Fluxo Transacional Completo de Ponta a Ponta (Jornada da O.S)
+
+A jornada a seguir detalha o ciclo de vida completo da Ordem de Serviço através dos microsserviços, combinando chamadas síncronas HTTP (para consultas e apontamentos granulares) e eventos assíncronos no Message Broker (para transições de estado do Saga e integrações financeiras):
 
 ```mermaid
 sequenceDiagram
     autonumber
     actor Cliente
+    actor Atendente
     participant OS as OS Service (NoSQL)
-    participant Broker as Broker (RabbitMQ / SQS)
+    participant Prod as Production Service (NoSQL)
+    participant Broker as Message Broker (RabbitMQ / SQS)
+    actor Mecanico
+    participant Auth as Gestão Usuários / Auth
     participant Billing as Billing Service (PostgreSQL)
-    participant MP as Mercado Pago
-    participant Prod as Production Service
+    participant MP as Mercado Pago API
 
-    Cliente->>OS: 1. Abertura de OS (Status: RECEBIDA)
-    OS->>OS: Diagnóstico concluído e itens selecionados
-    OS->>Broker: Publica evento "OrderDiagnosedEvent"
-    Broker->>Billing: Consome "OrderDiagnosedEvent"
-    Billing->>MP: Cria intenção de pagamento / QR Code Pix
-    Billing->>Broker: Publica "BudgetGeneratedEvent"
-    Billing-->>Cliente: Notifica orçamento com link/QR Code de pagamento
-    Cliente->>MP: Realiza pagamento
-    MP->>Billing: Webhook de confirmação de pagamento
-    Billing->>Billing: Registra pagamento (SQL ACID)
-    Billing->>Broker: Publica "PaymentConfirmedEvent"
-    Broker->>OS: Consome "PaymentConfirmedEvent" -> Atualiza OS para "APROVADA"
-    Broker->>Prod: Consome "PaymentConfirmedEvent" -> Enfileira para execução
-    Prod->>Prod: Inicia execução dos serviços (Status: EM_EXECUCAO)
-    Prod->>Prod: Finaliza reparos (apontamento de mão de obra)
-    Prod->>Broker: Publica "ProductionCompletedEvent"
-    Broker->>OS: Atualiza OS para "FINALIZADA" e pronta para entrega
+    rect rgb(225, 235, 245)
+    Note over Cliente,Prod: == 1. ENTRADA DO CLIENTE E DISPONIBILIZAÇÃO PARA PRODUÇÃO ==
+    Cliente->>OS: Solicita serviço informando veículo e serviços desejados
+    OS->>Prod: GET /api/v1/production/labors/summary (HTTP Feign)
+    Prod-->>OS: Retorna dados dos serviços (preços base, descrições)
+    OS->>OS: Captura snapshot dos serviços e grava O.S (Status: RECEBIDA)
+    OS->>Broker: Publica eventForDiagnostics { serviceOrderId }
+    Broker->>Prod: Consome eventForDiagnostics
+    Prod->>Prod: Grava na fila do pátio { serviceOrderId, status: RECEBIDA }
+    end
+
+    rect rgb(230, 245, 230)
+    Note over Mecanico,OS: == 2. INÍCIO E EXECUÇÃO DO DIAGNÓSTICO PELO MECÂNICO ==
+    Mecanico->>Prod: Inicia diagnóstico
+    Prod->>Prod: Atualiza status local para EM_DIAGNOSTICO
+    Prod->>Broker: Publica eventDiagnosis { serviceOrderId, mechanicId }
+    Broker->>OS: Consome eventDiagnosis
+    OS->>Auth: GET /api/v1/users/{mechanicId}
+    Auth-->>OS: Dados cadastrais do mecânico
+    OS->>OS: Atualiza O.S (Status: EM_DIAGNOSTICO, grava snapshot de mecânico)
+    Mecanico->>Prod: Adiciona peças necessárias durante a inspeção física
+    Prod->>OS: PATCH /api/serviceorder/{id}/add-supply [ { id, quantity, name, unitPrice } ]
+    OS->>OS: Atualiza O.S com lista de supplies
+    Mecanico->>Prod: Finaliza diagnóstico
+    Prod->>Broker: Publica eventDiagnosisCompleted { serviceOrderId }
+    end
+
+    rect rgb(255, 250, 220)
+    Note over Billing,MP: == 3. ORÇAMENTO E INTEGRAÇÃO COM GATEWAY DE PAGAMENTO ==
+    Broker->>Billing: Consome eventDiagnosisCompleted
+    Billing->>Billing: Calcula orçamento formal (ACID PostgreSQL)
+    Billing->>MP: Cria intenção de pagamento (Gera Pix / QR Code)
+    MP-->>Billing: Retorna dados de pagamento (Pix Copia-e-Cola / URL)
+    Billing->>Broker: Publica eventBudgetGenerated { serviceOrderId, totalLabors, totalSupplys, totalBudget, paymentUrl }
+    end
+
+    rect rgb(255, 235, 245)
+    Note over OS,Cliente: == 4. APROVAÇÃO DA O.S PELO CLIENTE ==
+    Broker->>OS: Consome eventBudgetGenerated
+    OS->>OS: Atualiza O.S com valores e link de pagamento
+    OS->>OS: Atualiza status da O.S para AGUARDANDO_APROVACAO
+    OS-->>Cliente: Notifica cliente com orçamento e link Pix
+    Cliente->>OS: Aprova ou recusa serviços (App / Web)
+    OS->>OS: Atualiza situation de cada serviço (APROVADO / REJEITADO)
+    end
+
+    rect rgb(255, 225, 225)
+    Note over Cliente,Prod: == 5. PAGAMENTO E LIBERAÇÃO PARA PRODUÇÃO ==
+    Cliente->>MP: Realiza pagamento via Pix
+    MP->>Billing: Webhook de confirmação de pagamento (IPN)
+    Billing->>Billing: Registra pagamento liquidado (ACID)
+    Billing->>Broker: Publica PaymentConfirmedEvent { serviceOrderId }
+    Broker->>OS: Consome PaymentConfirmedEvent
+    OS->>OS: Atualiza status da O.S para APROVADA
+    Broker->>Prod: Consome PaymentConfirmedEvent
+    Prod->>Prod: Atualiza status para APROVADA e libera na esteira de reparo
+    end
+
+    rect rgb(255, 240, 215)
+    Note over Mecanico,OS: == 6. EXECUÇÃO DOS SERVIÇOS NO PÁTIO ==
+    Mecanico->>Prod: Inicia execução de serviço específico
+    Prod->>OS: PUT /api/serviceorder/{id}/start-labor/{laborId}
+    OS->>OS: Atualiza status da O.S para EM_EXECUCAO
+    Mecanico->>Prod: Finaliza execução de serviço específico
+    Prod->>OS: PUT /api/serviceorder/{id}/finish-labor/{laborId}
+    OS->>OS: Registra término e data de finalização do serviço
+    Mecanico->>Prod: Finaliza todos os trabalhos da O.S
+    Prod->>OS: PATCH /api/serviceorder/{id}/update-status/?status=FINALIZADA
+    OS->>OS: Atualiza status da O.S para FINALIZADA
+    end
+
+    rect rgb(240, 240, 240)
+    Note over Cliente,Atendente: == 7. ENTREGA DO VEÍCULO ==
+    OS-->>Cliente: Notifica cliente ("Seu veículo está pronto para retirada!")
+    Cliente->>Atendente: Comparece à oficina para retirada
+    Atendente->>OS: PATCH /api/serviceorder/{id}/update-status/?status=ENTREGUE
+    OS->>OS: Valida status anterior (FINALIZADA), registra deliveryDate e status ENTREGUE
+    Atendente->>Cliente: Entrega chave e veículo finalizado
+    end
 ```
+
+#### Detalhamento Operacional das 7 Etapas
+
+1. **Entrada do Cliente (`RECEBIDA`):** O cliente/atendente seleciona serviços no balcão. O `OS Service` valida e captura o snapshot dos serviços via Feign Client no `Production Service`, salva o documento no MongoDB e emite `eventForDiagnostics` no broker para enfileirar o veículo no pátio.
+2. **Início do Diagnóstico (`EM_DIAGNOSTICO`):** O mecânico assume o veículo no pátio através do `Production Service`. O evento `eventDiagnosis` atualiza a OS e associa o mecânico. Conforme peças são identificadas na desmontagem/inspeção, são adicionadas via `PATCH /add-supply`. Ao concluir o laudo técnico, é publicado `eventDiagnosisCompleted`.
+3. **Orçamento e Gateway de Pagamento:** O `Billing Service` consome o término do diagnóstico, calcula o valor contábil oficial com taxas e descontos no PostgreSQL, interage com a API do Mercado Pago gerando o Pix dinâmico e publica `eventBudgetGenerated`.
+4. **Aprovação da O.S (`AGUARDANDO_APROVACAO`):** O `OS Service` recebe os valores consolidados e o link de pagamento, transiciona para `AGUARDANDO_APROVACAO` e notifica o cliente. O cliente pode aprovar ou reprovar itens individuais.
+5. **Pagamento e Liberação (`APROVADA`):** O webhook do Mercado Pago confirma o pagamento no `Billing Service`, que publica `PaymentConfirmedEvent`. Em paralelo (*Fanout*), a OS transiciona para `APROVADA` e a produção libera o carro para a esteira de execução dos mecânicos.
+6. **Execução no Pátio (`EM_EXECUCAO` ➔ `FINALIZADA`):** O mecânico aponta o início e fim de cada serviço via `PUT /start-labor` e `PUT /finish-labor`. Ao concluir todos os itens, a OS é marcada como `FINALIZADA`.
+7. **Entrega do Veículo (`ENTREGUE`):** O cliente retira o carro no balcão. O atendente registra a entrega via `PATCH /update-status/?status=ENTREGUE`, preenchendo o `deliveryDate` e finalizando o ciclo de vida.
 
 ### 4.2. Matriz de Compensação e Rollback (Tratamento de Falhas)
 
